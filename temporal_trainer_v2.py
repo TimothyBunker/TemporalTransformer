@@ -107,94 +107,88 @@ class ImprovedTemporalTrainer:
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     def scheduled_sampling_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Training step with scheduled sampling - with NaN checking"""
+        """Training with scheduled sampling using stochastic predictions"""
 
         input_ids = batch['input_ids'].to(self.device)
         labels = batch['labels'].to(self.device)
         B, T = input_ids.shape
 
-        # Skip if batch has issues
-        if torch.isnan(input_ids).any() or torch.isinf(input_ids).any():
-            print("WARNING: NaN/Inf in input_ids!")
-            return {'loss': 0.0, 'sampling_prob': 0.0, 'skipped': 1.0}
-
-        # Calculate current sampling probability
         sampling_prob = min(0.5, 0.1 * (self.current_epoch / self.num_epochs))
 
-        try:
-            # Standard forward pass first
-            outputs = self.model(input_ids[:, :-1])
+        # Standard forward pass
+        outputs = self.model(input_ids[:, :-1])
+        teacher_loss = F.cross_entropy(
+            outputs.reshape(-1, outputs.size(-1)),
+            labels[:, 1:].reshape(-1),
+            ignore_index=0
+        )
 
-            # Check for NaN in outputs
-            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-                print("WARNING: NaN/Inf in model outputs!")
-                print(f"Output stats - Mean: {outputs.mean().item():.4f}, Std: {outputs.std().item():.4f}")
-                return {'loss': 0.0, 'sampling_prob': 0.0, 'skipped': 1.0}
+        if sampling_prob > 0 and T > 10:  # Only for longer sequences
+            with torch.no_grad():
+                # MODIFIED: Use sampling instead of argmax
+                temperature = 0.8
+                logits = outputs / temperature
 
-            # Calculate loss
-            loss = F.cross_entropy(
-                outputs.reshape(-1, outputs.size(-1)),
+                # Apply top-k filtering
+                top_k = 50
+                top_k_logits, top_k_indices = torch.topk(logits, top_k, dim=-1)
+
+                # Sample from top-k
+                probs = F.softmax(top_k_logits, dim=-1)
+                sampled_indices = torch.multinomial(probs.view(-1, top_k), 1).view(B, -1)
+                predictions = torch.gather(top_k_indices, -1, sampled_indices.unsqueeze(-1)).squeeze(-1)
+
+                # Create mixed input with sampled predictions
+                replace_mask = torch.rand(B, outputs.size(1), device=self.device) < sampling_prob
+                replace_mask[:, :5] = False  # Keep first tokens
+
+                mixed_input = input_ids.clone()
+                mixed_input[:, 1:][replace_mask] = predictions[replace_mask]
+
+            # Forward with mixed input
+            mixed_outputs = self.model(mixed_input[:, :-1])
+            mixed_loss = F.cross_entropy(
+                mixed_outputs.reshape(-1, mixed_outputs.size(-1)),
                 labels[:, 1:].reshape(-1),
-                ignore_index=0,
-                reduction='mean'
+                ignore_index=0
             )
 
-            # Check if loss is valid
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"WARNING: NaN/Inf loss detected!")
-                print(f"Outputs shape: {outputs.shape}")
-                print(f"Labels shape: {labels.shape}")
-                print(f"Num valid labels: {(labels != 0).sum().item()}")
-                return {'loss': 0.0, 'sampling_prob': 0.0, 'skipped': 1.0}
+            total_loss = (1 - sampling_prob * 0.3) * teacher_loss + (sampling_prob * 0.3) * mixed_loss
+        else:
+            total_loss = teacher_loss
 
-            # Only do scheduled sampling if we have a valid base loss
-            if sampling_prob > 0 and random.random() < 0.5:  # Only do it 50% of the time
-                with torch.no_grad():
-                    predictions = torch.argmax(outputs, dim=-1)
+        total_loss.backward()
 
-                    # Create mask for replacement
-                    replace_mask = torch.rand(B, outputs.size(1), device=self.device) < sampling_prob
-                    replace_mask[:, :5] = False  # Keep first 5 tokens
+        return {
+            'loss': total_loss.item(),
+            'sampling_prob': sampling_prob
+        }
 
-                    # Create mixed input
-                    mixed_input = input_ids.clone()
-                    mixed_input[:, 1:][replace_mask] = predictions[replace_mask]
+    def binding_regularization_loss(self, model, strength=0.1):
+        """Regularize binding patterns to prevent over-chunking"""
+        reg_loss = 0.0
 
-                # Forward pass with mixed input
-                mixed_outputs = self.model(mixed_input[:, :-1])
-                mixed_loss = F.cross_entropy(
-                    mixed_outputs.reshape(-1, mixed_outputs.size(-1)),
-                    labels[:, 1:].reshape(-1),
-                    ignore_index=0,
-                    reduction='mean'
-                )
+        # Regularize pattern memory to prevent memorization
+        if hasattr(model, 'binder'):
+            for field in model.binder.binding_fields:
+                if hasattr(field, 'improved_field'):
+                    # L2 regularization on pattern memory
+                    pattern_memory = field.improved_field.pattern_memory
+                    reg_loss += strength * torch.norm(pattern_memory, p=2)
 
-                # Check mixed loss
-                if not torch.isnan(mixed_loss) and not torch.isinf(mixed_loss):
-                    loss = (1 - sampling_prob * 0.5) * loss + (sampling_prob * 0.5) * mixed_loss
+                    # Encourage diversity in patterns
+                    pattern_similarity = torch.matmul(
+                        F.normalize(pattern_memory, dim=-1),
+                        F.normalize(pattern_memory, dim=-1).T
+                    )
+                    # Penalize high similarity between different patterns
+                    off_diagonal = pattern_similarity - torch.eye(
+                        pattern_similarity.size(0),
+                        device=pattern_similarity.device
+                    )
+                    reg_loss += strength * torch.mean(torch.abs(off_diagonal))
 
-            # Final safety check
-            if torch.isnan(loss) or torch.isinf(loss):
-                print("WARNING: Final loss is NaN/Inf!")
-                return {'loss': 0.0, 'sampling_prob': sampling_prob, 'skipped': 1.0}
-
-            # Clip loss to prevent extreme values
-            loss = torch.clamp(loss, min=0.0, max=100.0)
-
-            # Backward
-            loss.backward()
-
-            return {
-                'loss': loss.item(),
-                'sampling_prob': sampling_prob,
-                'skipped': 0.0
-            }
-
-        except Exception as e:
-            print(f"ERROR in scheduled_sampling_step: {e}")
-            import traceback
-            traceback.print_exc()
-            return {'loss': 0.0, 'sampling_prob': 0.0, 'skipped': 1.0}
+        return reg_loss
 
     def adversarial_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Training with input perturbations to improve robustness"""
@@ -316,7 +310,7 @@ class ImprovedTemporalTrainer:
             return self.generation_aware_step(batch)
 
     def standard_training_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Standard training step with repetition penalty"""
+        """Enhanced training step with all improvements"""
 
         input_ids = batch['input_ids'].to(self.device)
         labels = batch['labels'].to(self.device)
@@ -324,24 +318,27 @@ class ImprovedTemporalTrainer:
         # Forward pass
         outputs = self.model(input_ids[:, :-1])
 
-        # Calculate repetition-aware loss
+        # Multi-scale repetition-aware loss
         loss, ce_loss, rep_penalty = self.repetition_aware_loss(
             outputs,
             labels[:, 1:],
             input_ids[:, :-1]
         )
 
-        # Check for NaN
-        if torch.isnan(loss) or torch.isinf(loss):
-            return {'loss': 0.0, 'skipped': 1.0}
+        # Add binding regularization
+        binding_reg = self.binding_regularization_loss(self.model, strength=0.01)
+
+        # Total loss
+        total_loss = loss + binding_reg
 
         # Backward
-        loss.backward()
+        total_loss.backward()
 
         return {
-            'loss': loss.item(),
+            'loss': total_loss.item(),
             'ce_loss': ce_loss,
             'rep_penalty': rep_penalty,
+            'binding_reg': binding_reg.item() if isinstance(binding_reg, torch.Tensor) else binding_reg,
             'skipped': 0.0
         }
 
@@ -578,31 +575,61 @@ class ImprovedTemporalTrainer:
             print(f"  '{prompt}' -> '{text}'")
 
     def repetition_aware_loss(self, outputs, labels, input_ids):
-        """Loss function that penalizes repetitive predictions"""
+        """Multi-scale repetition penalty"""
 
-        # Standard cross entropy loss
+        # Standard CE loss
         ce_loss = F.cross_entropy(
             outputs.reshape(-1, outputs.size(-1)),
             labels.reshape(-1),
             ignore_index=0
         )
 
-        # Get model predictions
-        predictions = torch.argmax(outputs, dim=-1)
+        # Get logits for repetition penalty
+        B, T, V = outputs.shape
 
-        # Calculate repetition penalty
-        repetition_penalty = 0.0
-        for b in range(predictions.size(0)):
-            for t in range(1, predictions.size(1)):
-                if predictions[b, t] == predictions[b, t - 1]:
-                    repetition_penalty += 1.0
+        # Penalize high probability on repeated tokens
+        repetition_loss = 0.0
 
-        repetition_penalty = repetition_penalty / (predictions.size(0) * predictions.size(1))
+        # 1. Immediate repetition penalty on logits
+        if T > 1:
+            # For each position, penalize if previous token has high probability
+            prev_tokens = input_ids[:, :T]  # Previous tokens
 
-        # Combined loss
-        total_loss = ce_loss + 2.0 * repetition_penalty
+            for t in range(1, T):
+                # Get logits at position t
+                logits_t = outputs[:, t, :]
 
-        return total_loss, ce_loss.item(), repetition_penalty
+                # Previous token
+                prev_token = prev_tokens[:, t]
+
+                # Probability assigned to previous token
+                prev_token_probs = F.softmax(logits_t, dim=-1)
+                repeat_probs = torch.gather(prev_token_probs, 1, prev_token.unsqueeze(1)).squeeze()
+
+                # Add to loss if probability is high
+                repetition_loss += torch.mean(torch.relu(repeat_probs - 0.1))  # Penalize if > 10%
+
+        # 2. N-gram repetition penalty
+        if T > 3:
+            # Check for repeated bigrams
+            for t in range(2, T):
+                if t >= 2:
+                    # Current bigram prediction
+                    curr_logits = outputs[:, t - 1:t + 1, :]
+                    curr_pred = torch.argmax(curr_logits, dim=-1)
+
+                    # Check against previous bigrams
+                    for prev_t in range(max(0, t - 10), t - 2):
+                        prev_bigram = input_ids[:, prev_t:prev_t + 2]
+
+                        # Penalize if predicting same bigram
+                        bigram_match = (curr_pred == prev_bigram).all(dim=1).float()
+                        repetition_loss += 0.5 * bigram_match.mean()
+
+        # Total loss with repetition penalty
+        total_loss = ce_loss + 3.0 * repetition_loss / max(T, 1)
+
+        return total_loss, ce_loss.item(), repetition_loss.item()
 
     def save_checkpoint(self, step: int, is_best: bool = False):
         """Save model checkpoint"""
