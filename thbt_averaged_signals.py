@@ -30,14 +30,7 @@ IGNORE_INDEX = -100
 
 
 class ImprovedBindingField(nn.Module):
-    """
-    Enhanced binding field with:
-    1. Contextual binding strength modulation
-    2. Learned binding patterns for common phrases
-    3. Adaptive threshold based on local context
-    """
-
-    def __init__(self, dim: int, max_chunk_size: int = 5, base_threshold: float = BIND_THRESHOLD):
+    def __init__(self, dim: int, max_chunk_size: int = 5, base_threshold: float = 0.45):
         super().__init__()
         self.dim = dim
         self.max_chunk_size = max_chunk_size
@@ -49,20 +42,24 @@ class ImprovedBindingField(nn.Module):
 
         # Contextual modulation
         self.context_modulator = nn.Sequential(
-            nn.Linear(dim * 3, dim),  # left, center, right context
+            nn.Linear(dim * 3, dim),
             nn.ReLU(),
             nn.Linear(dim, 1),
             nn.Sigmoid()
         )
 
-        # Learned binding patterns (for common multi-token expressions)
-        self.pattern_memory = nn.Parameter(torch.randn(100, dim))
+        # MODIFIED: Smaller pattern memory with regularization
+        self.pattern_memory = nn.Parameter(torch.randn(50, dim) * 0.1)  # Smaller, weaker initialization
         self.pattern_key = nn.Linear(dim, dim)
+
+        # Add dropout to pattern matching
+        self.pattern_dropout = nn.Dropout(0.3)
 
         # Adaptive threshold
         self.threshold_adapter = nn.Sequential(
             nn.Linear(dim, 64),
             nn.ReLU(),
+            nn.Dropout(0.2),  # Add dropout
             nn.Linear(64, 1),
             nn.Sigmoid()
         )
@@ -88,7 +85,6 @@ class ImprovedBindingField(nn.Module):
             center = x[:, i:i + 1]
             right = x[:, i + 1:min(T, i + 2)]
 
-            # Pad if necessary
             if left.size(1) == 0:
                 left = torch.zeros(B, 1, D, device=x.device)
             if right.size(1) == 0:
@@ -100,42 +96,43 @@ class ImprovedBindingField(nn.Module):
         context_features = torch.stack(context_features, dim=1)
         context_modulation = self.context_modulator(context_features).squeeze(-1)
 
-        # --- pattern boost --------------------------------------------------
-        # 1) cosine-normalise so dot products ∈ [-1, 1]
-        pattern_keys = F.normalize(self.pattern_key(x[:, :-1]), dim=-1)  # (B, T-1, D)
-        patterns = F.normalize(self.pattern_memory, dim=-1)  # (P, D)
+        # MODIFIED: Weaker pattern boost with noise
+        pattern_keys = self.pattern_dropout(self.pattern_key(x[:, :-1]))
+        patterns = F.normalize(self.pattern_memory, dim=-1)
+        pattern_keys = F.normalize(pattern_keys, dim=-1)
 
-        # 2) similarity to each stored pattern
-        pattern_scores = torch.matmul(pattern_keys, patterns.T)  # (B, T-1, P)
+        pattern_scores = torch.matmul(pattern_keys, patterns.T)
 
-        # 3) Use softmax to get attention over patterns (more differentiable)
-        pattern_attention = F.softmax(pattern_scores / 0.1, dim=-1)  # temperature=0.1 for sharper attention
+        # Use softmax instead of max for smoother gradients
+        pattern_attention = F.softmax(pattern_scores / 0.5, dim=-1)  # Higher temperature
+        weighted_scores = (pattern_attention * pattern_scores).sum(dim=-1)
 
-        # 4) Get weighted combination of pattern scores
-        weighted_scores = (pattern_attention * pattern_scores).sum(dim=-1)  # (B, T-1)
+        # REDUCED pattern boost effect
+        pattern_boost = 0.2 * torch.sigmoid(weighted_scores)  # Much smaller boost
 
-        # 5) Convert to boost factor
-        pattern_boost = torch.sigmoid(weighted_scores * 5.0)  # Sigmoid gives [0, 1] range
-        # --------------------------------------------------------------------
-
-        # --- final binding strength -----------------------------------------
-        # Use consistent pattern boost
-        enhanced_binding = binding_strength * context_modulation * (1 + 0.5 * pattern_boost)
+        # MODIFIED: Less aggressive combination
+        enhanced_binding = binding_strength * context_modulation * (1 + pattern_boost)
         enhanced_binding = torch.clamp(enhanced_binding, 0, 1)
 
-        # Adaptive threshold
-        adaptive_thresholds = self.base_threshold + 0.1 * self.threshold_adapter(x[:, :-1]).squeeze(-1)
+        # MODIFIED: More conservative adaptive thresholds
+        adaptive_thresholds = self.base_threshold + 0.05 * self.threshold_adapter(x[:, :-1]).squeeze(-1)
+
+        # Add noise during training to prevent overfitting to patterns
+        if self.training:
+            noise = torch.randn_like(enhanced_binding) * 0.05
+            enhanced_binding = enhanced_binding + noise
 
         # Create binding mask
         binding_mask = torch.zeros(B, T, device=x.device)
         binding_mask[:, 1:] = (enhanced_binding > adaptive_thresholds).float()
 
         analysis = {
-            'base_strength': binding_strength,
-            'context_modulation': context_modulation,
-            'pattern_boost': pattern_boost,
-            'adaptive_thresholds': adaptive_thresholds,
-            'enhanced_binding': enhanced_binding
+            'base_strength': binding_strength.mean().item(),
+            'context_modulation': context_modulation.mean().item(),
+            'pattern_boost': pattern_boost.mean().item(),
+            'adaptive_thresholds': adaptive_thresholds.mean().item(),
+            'enhanced_binding': enhanced_binding.mean().item(),
+            'percent_bound': binding_mask.mean().item()
         }
 
         return binding_mask, enhanced_binding, analysis
@@ -788,18 +785,18 @@ def enhanced_train_and_compare(num_steps: int = 1000,
     print("Training Complete! Generating final analysis...")
 
     # Standard analysis plots
-    analyzer.plot_analysis(save_path='enhanced_binding_analysis.png')
+    analyzer.plot_analysis(save_path='plots/enhanced_binding_analysis.png')
 
     # Final chunk formation patterns
     visualizer.visualize_chunk_formation(
         temporal_model, inputs, metadata, num_steps,
-        save_path='final_chunk_formation.png'
+        save_path='plots/final_chunk_formation.png'
     )
 
     # Final temporal dynamics
     visualizer.visualize_temporal_dynamics(
         temporal_model, inputs,
-        save_path='final_temporal_dynamics.png'
+        save_path='plots/final_temporal_dynamics.png'
     )
 
     # Comprehensive generalization test
@@ -818,7 +815,7 @@ def enhanced_train_and_compare(num_steps: int = 1000,
 
     generalization_results = visualizer.analyze_generalization(
         temporal_model, extended_test_sentences,
-        save_path='final_generalization_analysis.png'
+        save_path='plots/final_generalization_analysis.png'
     )
 
     # Print binding pattern statistics
